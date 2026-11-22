@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { parseAction, normalizeQuestions, normalizeHistory, collapseRepeat } from './index.js';
+import { parseAction, normalizeQuestions, normalizeHistory, extractObjects, collapseRepeat } from './index.js';
 
 // 批量问句：多条一起返回，各自的选项保留
 const batch = parseAction(
@@ -46,8 +46,31 @@ assert.equal(plain.text, '直接给一段中文。');
 // 包了代码围栏也能解
 assert.equal(parseAction('```json\n{"action":"final","text":"甲"}\n```').text, '甲');
 
-// ask 但没有任何有效问句：退化成 final，不能凭空造问
-assert.equal(parseAction('{"action":"ask","questions":[]}').action, 'final');
+// ask 但没有任何有效问句：不是可用的动作，按格式异常处理（不把 JSON 写进草稿）
+assert.equal(parseAction('{"action":"ask","questions":[]}').action, 'invalid');
+
+// 一轮吐多个 JSON 对象：取第一个完整的，多余的直接丢掉
+const doubled = parseAction(
+  '{"action":"final","text":"甲公司介绍"}\n{"action":"final","text":"placeholder"}',
+);
+assert.equal(doubled.action, 'final');
+assert.equal(doubled.text, '甲公司介绍');
+
+// 正文里含花括号也不影响配对（字符串内的括号必须跳过）
+const braced = parseAction('{"action":"final","text":"代码用 function f(){ return 1 } 说明"}');
+assert.equal(braced.action, 'final');
+assert.equal(braced.text, '代码用 function f(){ return 1 } 说明');
+
+// 转义引号同样不干扰配对
+const escapedQuote = parseAction('{"action":"final","text":"他说\\"你好\\"然后走了"}');
+assert.equal(escapedQuote.action, 'final');
+assert.equal(escapedQuote.text, '他说"你好"然后走了');
+
+// 看着是 JSON 却全都解不出：报格式异常，不把 JSON 原文当改写结果
+assert.equal(parseAction('{"action":"final","text":}').action, 'invalid');
+
+// extractObjects 只抓顶层、按顺序
+assert.deepEqual(extractObjects('前言 {"a":1} 中间 {"b":{"c":2}} 结尾'), ['{"a":1}', '{"b":{"c":2}}']);
 
 // 问答记录：缺字段丢弃，超量保留最近 12 条
 assert.equal(normalizeHistory([{ question: 'q' }, { answer: 'a' }]).length, 0);

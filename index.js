@@ -121,29 +121,70 @@ export function normalizeQuestions(raw) {
   return questions;
 }
 
+/** 按顺序找出文本里所有顶层 JSON 对象候选，字符串里的花括号不参与配对。
+ *  模型偶尔一轮吐出多个对象，必须逐个尝试，不能从第一个左花括号切到最后一个右花括号——
+ *  那样切出来是多个对象拼在一起，JSON.parse 直接失败，整段就被当成纯文本改写结果输出。 */
+export function extractObjects(text) {
+  const found = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (ch === '}') {
+      if (depth === 0) continue;
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        found.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+  return found;
+}
+
 /** 解析模型这一轮的动作。问句优先；能解析出最终文本就当收尾；
  *  什么都没解析出来的裸文本也按最终结果处理，避免整次改写白跑。 */
 export function parseAction(raw) {
   const cleaned = stripFence(collapseRepeat(raw));
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start !== -1 && end > start) {
+  // 逐个候选尝试，取第一个语义完整的；后面的多余对象直接忽略。
+  const candidates = extractObjects(cleaned);
+  for (const candidate of candidates) {
     let parsed;
     try {
-      parsed = JSON.parse(cleaned.slice(start, end + 1));
+      parsed = JSON.parse(candidate);
     } catch {
-      parsed = undefined;
+      continue;
     }
-    if (parsed && typeof parsed === 'object') {
-      if (parsed.action === 'ask') {
-        // 新旧两种问法都收：批量 questions 数组优先，退到单个 question。
-        const questions = normalizeQuestions(Array.isArray(parsed.questions) ? parsed.questions : [parsed]);
-        if (questions.length > 0) return { action: 'ask', questions };
-      }
-      const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
-      if (text !== '') return { action: 'final', text };
+    if (!parsed || typeof parsed !== 'object') continue;
+    if (parsed.action === 'ask') {
+      // 新旧两种问法都收：批量 questions 数组优先，退到单个 question。
+      const questions = normalizeQuestions(Array.isArray(parsed.questions) ? parsed.questions : [parsed]);
+      if (questions.length > 0) return { action: 'ask', questions };
+      continue;
     }
+    const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+    if (text !== '') return { action: 'final', text };
   }
+  // 整段以 { 开头却一个都解不出：说明模型给了坏掉的 JSON 信封，不能把它的原文当改写结果。
+  // 不以 { 开头的是普通文本改写，里面夹花括号很正常，照常放行。
+  if (candidates.length > 0 && cleaned.startsWith('{')) return { action: 'invalid', text: '' };
   return { action: 'final', text: cleaned };
 }
 
@@ -239,6 +280,11 @@ export function apply(ctx) {
     // 到上限还提问就是违约：明确报错，客户端保留问答记录，重试一轮就能收口。
     if (action.action === 'ask' && remaining <= 0) {
       sendJson(res, 502, { ok: false, reason: 'ask-after-limit', message: '提问次数已用完，模型仍在提问' });
+      return;
+    }
+    // 格式坏了就别把原始 JSON 写进草稿：让用户看到错误并重试，比污染输入好。
+    if (action.action === 'invalid') {
+      sendJson(res, 502, { ok: false, reason: 'bad-output', message: '模型输出格式异常，请重试' });
       return;
     }
 
